@@ -5,7 +5,191 @@ import pydeck as pdk
 import pandas as pd
 import json
 import os
+import numpy as np
+import itertools
+from itertools import combinations
+import plotly.graph_objects as go
+from functools import lru_cache
 
+random.seed(30)
+np.random.seed(30)
+
+def quick_feasible(truck_dims, items):
+    L, W, H = truck_dims
+    total_vol = sum(l*w*h for l, w, h in (it['dims'] for it in items))
+    if total_vol > L*W*H:
+        return False
+    total_base = sum(l*w for l, w, _ in (it['dims'] for it in items))
+    if total_base > L*W:
+        return False
+    return True
+
+@lru_cache(maxsize=128)
+def packing_penalty_cache(truck_dims, items_tuple):
+    items = [ {'id':i[0], 'name':i[1], 'dims':i[2]} for i in items_tuple ]
+    packer = PackingPSO(truck_dims, items)
+    _, pen = packer.optimize(max_iters=100)
+    return pen
+
+class PackingPSO:
+    def __init__(self, truck_dims, items,
+                 angles=(0, math.pi/4, math.pi/2, 3*math.pi/4, math.pi),
+                 compaction_weight=1e-3):
+        """
+        truck_dims: (L, W, H)
+        items: list of {'name', 'dims':(lx,ly,lz)}
+        angles: allowed yaw rotations around vertical axis
+        compaction_weight: penalty weight for unused bounding‐box volume
+        """
+        self.L, self.W, self.H = truck_dims
+        self.items = items
+        self.n = len(items)
+        self.dim = self.n * 4
+
+        self.angles = angles
+        self.K = len(angles)
+
+        self.num_particles = 30
+        self.c1 = 1.5
+        self.c2 = 1.5
+
+        self.comp_w = compaction_weight
+
+        self.particles = []
+        self.velocities = []
+        self.pbest_pos = []
+        self.pbest_score = []
+        self.gbest_pos = None
+        self.gbest_score = float('inf')
+
+        for _ in range(self.num_particles):
+            pos = np.zeros(self.dim)
+            vel = np.zeros(self.dim)
+            for i in range(self.n):
+                lx, ly, lz = items[i]['dims']
+                pos[4*i+0] = np.random.uniform(0, self.L)
+                pos[4*i+1] = np.random.uniform(0, self.W)
+                pos[4*i+2] = np.random.uniform(0, self.H)
+                pos[4*i+3] = np.random.uniform(0, self.K)
+                vel[4*i:4*i+4] = np.random.uniform(-1, 1, 4)
+            self._clamp(pos)
+            score = self._penalty(pos)
+            self.particles.append(pos.copy())
+            self.velocities.append(vel)
+            self.pbest_pos.append(pos.copy())
+            self.pbest_score.append(score)
+            if score < self.gbest_score:
+                self.gbest_score, self.gbest_pos = score, pos.copy()
+
+    def _clamp(self, pos):
+        """Clamp x,y,z within [0,dim] and orientation index within [0,K-ε]."""
+        for i in range(self.n):
+            pos[4*i+0] = np.clip(pos[4*i+0], 0, self.L)
+            pos[4*i+1] = np.clip(pos[4*i+1], 0, self.W)
+            pos[4*i+2] = np.clip(pos[4*i+2], 0, self.H)
+            idx = pos[4*i+3]
+            pos[4*i+3] = min(max(idx, 0), self.K - 1e-3)
+
+    def _penalty(self, pos):
+        placement = []
+        total_vol = 0
+        for i in range(self.n):
+            x, y, z = pos[4*i:4*i+3]
+            ori = int(pos[4*i+3])
+            θ = self.angles[ori]
+            lx, ly, lz = self.items[i]['dims']
+            w = abs(lx*math.cos(θ)) + abs(ly*math.sin(θ))
+            d = abs(lx*math.sin(θ)) + abs(ly*math.cos(θ))
+            placement.append({'x':x,'y':y,'z':z,'w':w,'d':d,'h':lz})
+            total_vol += lx*ly*lz
+
+        pen = 0.0
+        for it in placement:
+            if it['x'] < 0:
+                pen += OUTBOUND_PENALTY_FACTOR * (-it['x'] * it['d'] * it['h'])
+            if it['y'] < 0:
+                pen += OUTBOUND_PENALTY_FACTOR * (-it['y'] * it['w'] * it['h'])
+            if it['z'] < 0:
+                pen += OUTBOUND_PENALTY_FACTOR * (-it['z'] * it['w'] * it['d'])
+
+            x_over = max(it['x']+it['w'] - self.L, 0)
+            y_over = max(it['y']+it['d'] - self.W, 0)
+            z_over = max(it['z']+it['h'] - self.H, 0)
+            pen += OVERLAP_PENALTY_FACTOR * (
+                x_over * it['d'] * it['h'] +
+                y_over * it['w'] * it['h'] +
+                z_over * it['w'] * it['d']
+            )
+
+        for A,B in combinations(placement,2):
+            ox = min(A['x']+A['w'], B['x']+B['w']) - max(A['x'], B['x'])
+            oy = min(A['y']+A['d'], B['y']+B['d']) - max(A['y'], B['y'])
+            oz = min(A['z']+A['h'], B['z']+B['h']) - max(A['z'], B['z'])
+            if ox>0 and oy>0 and oz>0:
+                pen += OVERLAP_PENALTY_FACTOR * (ox * oy * oz)
+
+        for i, it in enumerate(placement):
+            if it['z'] < 1e-6: continue
+            supported = False
+            base_z = it['z']
+            for j, base in enumerate(placement):
+                if j==i: continue
+                if abs(base['z']+base['h'] - base_z) < 1e-6:
+                    if (base['x']<=it['x']+1e-6
+                        and base['x']+base['w']>=it['x']+it['w']-1e-6
+                        and base['y']<=it['y']+1e-6
+                        and base['y']+base['d']>=it['y']+it['d']-1e-6):
+                        supported = True
+                        break
+            if not supported:
+                pen += OVERLAP_PENALTY_FACTOR * (self.L * self.W * self.H)
+
+        max_x = max(it['x']+it['w'] for it in placement)
+        max_y = max(it['y']+it['d'] for it in placement)
+        max_z = max(it['z']+it['h'] for it in placement)
+        used_vol = max_x * max_y * max_z
+        pen += self.comp_w * (used_vol - total_vol)
+
+        return pen
+
+    def optimize(self, max_iters=100):
+        for t in range(max_iters):
+            w = W_MAX - (W_MAX - W_MIN) * (t / float(max_iters - 1))
+            for p in range(self.num_particles):
+                r1, r2 = np.random.rand(self.dim), np.random.rand(self.dim)
+                vel = ( w * self.velocities[p]
+                      + self.c1 * r1 * (self.pbest_pos[p] - self.particles[p])
+                      + self.c2 * r2 * (self.gbest_pos - self.particles[p]) )
+                self.velocities[p] = vel
+                self.particles[p] += vel
+                self._clamp(self.particles[p])
+
+                sc = self._penalty(self.particles[p])
+                if sc < self.pbest_score[p]:
+                    self.pbest_score[p] = sc
+                    self.pbest_pos[p]   = self.particles[p].copy()
+                if sc < self.gbest_score:
+                    self.gbest_score = sc
+                    self.gbest_pos   = self.particles[p].copy()
+
+            if self.gbest_score <= 0:
+                break
+
+        layout = []
+        pos = self.gbest_pos
+        for i in range(self.n):
+            ori = int(pos[4*i+3]); θ = self.angles[ori]
+            lx, ly, lz = self.items[i]['dims']
+            w = abs(lx*math.cos(θ)) + abs(ly*math.sin(θ))
+            d = abs(lx*math.sin(θ)) + abs(ly*math.cos(θ))
+            layout.append({
+                'name': self.items[i]['name'],
+                'x': pos[4*i], 'y': pos[4*i+1], 'z': pos[4*i+2],
+                'w': w, 'd': d, 'h': lz,
+                'angle_deg': round(math.degrees(θ),1)
+            })
+        return layout, self.gbest_score
+    
 ###############################
 # Load Distance Data
 ###############################
@@ -43,7 +227,19 @@ items = [
     {"id": "Item5", "name": "Sofa", "weight": 500, "dims": (150, 80, 100), "city": "Yogyakarta"},
     {"id": "Item6", "name": "Meja", "weight": 150, "dims": (120, 100, 40), "city": "Semarang"},
     {"id": "Item7", "name": "Ranjang", "weight": 400, "dims": (200, 160, 50), "city": "Malang"},
-    {"id": "Item8", "name": "Kipas Angin", "weight": 30, "dims": (20, 20, 40), "city": "Bandung"}
+    {"id": "Item8", "name": "Kipas Angin", "weight": 30, "dims": (20, 20, 40), "city": "Bandung"},
+    {"id": "Item9",  "name": "WashingMachine","weight":350, "dims": (60,60,85), "city": "Jakarta"},
+    {"id": "Item10", "name": "Bookshelf", "weight":100, "dims": (80,30,180), "city": "Surabaya"},
+    {"id": "Item11", "name": "Mattress", "weight":200, "dims": (200,90,30), "city": "Bandung"},
+    {"id": "Item12", "name": "Wardrobe", "weight":450, "dims": (100,60,200), "city": "Yogyakarta"},
+    {"id": "Item13", "name": "DiningTable", "weight":250, "dims": (160,90,75), "city": "Semarang"},
+    {"id": "Item14", "name": "DeskLamp", "weight":10,  "dims": (15,15,40), "city": "Malang"},
+    {"id": "Item15", "name": "Microwave", "weight":40,  "dims": (50,40,35), "city": "Jakarta"},
+    {"id": "Item16", "name": "Printer", "weight":25,  "dims": (45,40,30), "city": "Surabaya"},
+    {"id": "Item17", "name": "FloorLamp", "weight":20,  "dims": (30,30,160), "city": "Bandung"},
+    {"id": "Item18", "name": "AirPurifier", "weight":15,  "dims": (25,25,60), "city": "Yogyakarta"},
+    {"id": "Item19", "name": "WaterHeater", "weight":80,  "dims": (50,50,100), "city": "Semarang"},
+    {"id": "Item20", "name": "CoffeeTable", "weight":80,  "dims": (120,60,45), "city": "Malang"},
 ]
 
 n_trucks = 4
@@ -68,11 +264,11 @@ def get_dimension_category(l, w, h):
     """Menentukan kategori dimensi dan faktor biaya berdasarkan volume."""
     volume = l * w * h
     if volume < threshold_small:
-        return "Kecil", 10
+        return "Kecil", 50
     elif volume < threshold_medium:
-        return "Sedang", 15
+        return "Sedang", 75
     else:
-        return "Besar", 20
+        return "Besar", 100
 
 for item in items:
     l, w, h = item["dims"]
@@ -86,6 +282,7 @@ for item in items:
 ###############################
 # Fungsi Perhitungan Jarak (Haversine)
 ###############################
+@st.cache_data(show_spinner=False)
 def haversine(coord1, coord2):
     """
     Menghitung jarak antara dua titik (lat, lon) dengan rumus Haversine.
@@ -102,6 +299,7 @@ def haversine(coord1, coord2):
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
 
+@st.cache_data(show_spinner=False)
 def distance(city1, city2):
     """Get distance from CSV if available, otherwise use Haversine formula."""
     if (city1, city2) in distance_dict:
@@ -111,6 +309,7 @@ def distance(city1, city2):
     else:
         return haversine(city_coords[city1], city_coords[city2])
 
+@st.cache_data(show_spinner=False)
 def route_distance(cities):
     """
     Menghitung jarak rute pulang-pergi dari Surabaya melewati semua kota dalam list
@@ -134,38 +333,68 @@ def route_distance(cities):
 ###############################
 def compute_fitness(assignment):
     """
-    Menghitung total profit (fitness) dari satu solusi assignment.
-    assignment: list dengan panjang = jumlah barang, berisi nomor truk (0-4) untuk tiap barang.
+    Soft‐penalty version of fitness:
+      - Accumulates penalties for items that don't fit any orientation
+        (OUTBOUND_PENALTY_FACTOR × item_volume).
+      - Adds a large penalty if quick_feasible fails.
+      - Adds the inner packing-penalty from packing_penalty_cache.
+    Returns: (revenue - fuel_cost) - total_penalty
     """
-    truck_info = {t: {"weight": 0, "volume": 0, "cities": [], "revenue": 0} for t in range(1, n_trucks+1)}
-    total_revenue = 0
-    for i, truck in enumerate(assignment):
+    truck_info = {
+        t: {"items": [], "cities": [], "revenue": 0.0}
+        for t in range(1, n_trucks+1)
+    }
+    total_revenue = 0.0
+    total_penalty = 0.0
+
+    for idx, truck in enumerate(assignment):
         if truck == 0:
             continue
-        item = items[i]
+        item = items[idx]
         l, w, h = item["dims"]
-        if l > truck_max_length or w > truck_max_width or h > truck_max_height:
-            return -1e9
-        truck_info[truck]["weight"] += item["weight"]
-        truck_info[truck]["volume"] += (l * w * h)
-        truck_info[truck]["cities"].append(item["city"])
-        
+        item_vol = l * w * h
+
+        if not any(
+            perm[0] <= truck_max_length and
+            perm[1] <= truck_max_width  and
+            perm[2] <= truck_max_height
+            for perm in itertools.permutations((l, w, h))
+        ):
+            total_penalty += OUTBOUND_PENALTY_FACTOR * item_vol
+            continue
+
         d = distance("Surabaya", item["city"])
-        revenue = item["weight"] * d * item["cat_factor"]
-        truck_info[truck]["revenue"] += revenue
-        total_revenue += revenue
-    
+        rev = item["weight"] * d * item["cat_factor"]
+        truck_info[truck]["items"].append(item)
+        truck_info[truck]["revenue"] += rev
+        total_revenue += rev
+        truck_info[truck]["cities"].append(item["city"])
+
     for t, info in truck_info.items():
-        if info["weight"] > truck_max_weight or info["volume"] > (truck_max_length*truck_max_width*truck_max_height):
-            return -1e9
-   
-    fuel_cost_per_km = 3500.0
-    total_cost = 0.0
-    for t, info in truck_info.items():
-        if info["cities"]:
-            total_cost += fuel_cost_per_km * route_distance(info["cities"])
+        its = info["items"]
+        if not its:
+            continue
+
+        if not quick_feasible((truck_max_length, truck_max_width, truck_max_height), its):
+            total_penalty += 1000.0      
+
+        tpl = tuple((it["id"], it["name"], it["dims"]) for it in its)
+        pen = packing_penalty_cache((truck_max_length, truck_max_width, truck_max_height), tpl)
+        total_penalty += pen
+
+    FUEL_PRICE_PER_L       = 9000
+    TRUCK_CONSUMPTION_KM_L = 4
+    cost_per_km = FUEL_PRICE_PER_L / TRUCK_CONSUMPTION_KM_L
+
+    total_cost = sum(
+        cost_per_km * route_distance(info["cities"])
+        for info in truck_info.values() if info["cities"]
+    )
+
     profit = total_revenue - total_cost
-    return profit
+    return profit - total_penalty
+
+
 
 def decode_position(position):
     """Konversi posisi continuous ke assignment diskrit (0-4) dengan pembulatan terdekat."""
@@ -183,24 +412,27 @@ def decode_position(position):
 ###############################
 # PSO: Inisialisasi dan Iterasi
 ###############################
-num_particles = 10
-max_iter = 50
-w_inertia = 0.7
-c1 = 1.5
-c2 = 1.5
+num_particles = 30
+max_iter = 1000
+patience = 50
+W_MAX = 0.9
+W_MIN = 0.4
+c1 = 2.0
+c2 = 2.0
+OVERLAP_PENALTY_FACTOR  = 2.0
+OUTBOUND_PENALTY_FACTOR = 2.0
 
 improvement_threshold = 1.0
 patience = 10
+no_improvement_count = 0
 
 particles = []
 velocities = []
 pbest_positions = []
 pbest_fitness = []
 gbest_position = None
-gbest_fitness = -1e9
-prev_gbest = -1e9
-
-random.seed(30)
+gbest_fitness = -float('inf')
+prev_gbest = -float('inf')
 
 for _ in range(num_particles):
     position = []
@@ -219,13 +451,15 @@ for _ in range(num_particles):
     if fit > gbest_fitness:
         gbest_fitness = fit
         gbest_position = position[:]
-
+        
+fitness_history = []
 for it in range(1, max_iter+1):
+    w = W_MAX - (W_MAX - W_MIN) * ((it-1)/(max_iter-1))
     for i in range(num_particles):
         for d in range(len(items)):
             r1 = random.random()
             r2 = random.random()
-            velocities[i][d] = (w_inertia * velocities[i][d] +
+            velocities[i][d] = (w * velocities[i][d] +
                                 c1 * r1 * (pbest_positions[i][d] - particles[i][d]) +
                                 c2 * r2 * (gbest_position[d] - particles[i][d]))
             particles[i][d] += velocities[i][d]
@@ -239,7 +473,7 @@ for it in range(1, max_iter+1):
             gbest_position = particles[i][:]
             
     improvement = gbest_fitness - prev_gbest
-    print(f"Iter {it}: Profit = {gbest_fitness:.2f}, Improvement = {improvement:.2f}")
+    fitness_history.append(gbest_fitness)
     if improvement <= improvement_threshold:
         no_improvement_count += 1
         if no_improvement_count >= patience:
@@ -247,6 +481,7 @@ for it in range(1, max_iter+1):
             break
     else:
         no_improvement_count = 0
+    print(f"current gbest: {gbest_fitness}, prev gbest: {prev_gbest}")
     prev_gbest = gbest_fitness
 
 best_assignment = decode_position(gbest_position)
@@ -353,8 +588,56 @@ for t in range(1, n_trucks+1):
 ###############################
 # Visualisasi dengan Streamlit (Updated)
 ###############################
+def create_truck_figure(truck_dims, packed_items):
+    L, W, H = truck_dims
+    fig = go.Figure()
+    for idx, item in enumerate(packed_items):
+        xmin, ymin, zmin = item['x'], item['y'], item['z']
+        xmax = xmin + item['w']
+        ymax = ymin + item['d']
+        zmax = zmin + item['h']
+        xverts = [xmin, xmin, xmax, xmax, xmin, xmin, xmax, xmax]
+        yverts = [ymin, ymax, ymax, ymin, ymin, ymax, ymax, ymin]
+        zverts = [zmin, zmin, zmin, zmin, zmax, zmax, zmax, zmax]
+        faces_i = [7, 0, 0, 0, 4, 4, 6, 6, 4, 0, 3, 1]
+        faces_j = [3, 4, 1, 2, 5, 6, 5, 2, 0, 1, 6, 2]
+        faces_k = [0, 7, 2, 3, 6, 7, 1, 5, 4, 5, 7, 6]
+        color_palette = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+                         "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
+        color = color_palette[idx % len(color_palette)]
+        fig.add_trace(go.Mesh3d(
+            x=xverts, y=yverts, z=zverts,
+            i=faces_i, j=faces_j, k=faces_k,
+            color=color, opacity=0.8,
+            name=item['name'],
+            hovertext=f"{item['name']}: {item['w']}x{item['d']}x{item['h']}",
+            hoverinfo="text"
+        ))
+    corners = [(0,0,0), (L,0,0), (L,W,0), (0,W,0), (0,0,H), (L,0,H), (L,W,H), (0,W,H)]
+    edges = [(0,1), (1,2), (2,3), (3,0),
+             (4,5), (5,6), (6,7), (7,4),
+             (0,4), (1,5), (2,6), (3,7)]
+    edge_x = []; edge_y = []; edge_z = []
+    for (u, v) in edges:
+        edge_x += [corners[u][0], corners[v][0], None]
+        edge_y += [corners[u][1], corners[v][1], None]
+        edge_z += [corners[u][2], corners[v][2], None]
+    fig.add_trace(go.Scatter3d(x=edge_x, y=edge_y, z=edge_z,
+                               mode='lines', line_color='black', line_width=3,
+                               hoverinfo='skip', showlegend=False))
+    fig.update_layout(
+        scene = dict(xaxis=dict(range=[0, L], title='Length'),
+                     yaxis=dict(range=[0, W], title='Width'),
+                     zaxis=dict(range=[0, H], title='Height'),
+                     aspectmode='data'),
+        margin=dict(l=0, r=0, t=30, b=0),
+        showlegend=False
+    )
+    return fig
+
+st.line_chart(fitness_history, height=200, width=400)
 st.title("Optimasi Penempatan Barang dengan PSO")
-st.write(f"**Total Profit:** {gbest_fitness:,.2f}")
+st.write(f"**Total Profit:** {gbest_fitness:,.2f} (selama ada penalty berarti bukan profit asli)")
 
 st.subheader("Rute Pengiriman per Truk")
 if routes_data:
@@ -451,3 +734,53 @@ for t in range(1, n_trucks+1):
 profit_df = pd.DataFrame(profit_data).set_index("Truk")
 st.subheader("Distribusi Profit per Truk")
 st.bar_chart(profit_df)
+
+final_layouts = {}
+for t in range(1, n_trucks+1):
+    items_for_truck = truck_info[t]["items"]
+    if not items_for_truck:
+        continue
+    best_penalty = float('inf')
+    best_layout = None
+    for seed in (42, 99, 2025):
+        np.random.seed(seed)
+        packer = PackingPSO(
+            (truck_max_length, truck_max_width, truck_max_height),
+            items_for_truck
+        )
+        layout, penalty = packer.optimize(max_iters=200)
+        if penalty < best_penalty:
+            best_penalty, best_layout = penalty, layout
+            if penalty == 0:
+                break
+    final_layouts[t] = (best_layout, best_penalty)
+
+st.subheader("Visualisasi Muatan per Truk")
+for t in range(1, n_trucks+1):
+    layout, penalty = final_layouts.get(t, (None, None))
+    if layout is None:
+        st.write(f"Truk {t}: tidak ada muatan.")
+    elif penalty > 0:
+        st.error(f"⚠️ Truk {t} gagal dipacking (penalty={penalty:.0f}).")
+        fallback = []
+        x_off = 0
+        for item in truck_info[t]["items"]:
+            l,w,h = item["dims"]
+            fallback.append({
+                'name': item['name'],
+                'x': x_off, 'y': 0, 'z': 0,
+                'w': l, 'd': w, 'h': h
+            })
+            x_off += l + 5
+        fig = create_truck_figure(
+            (truck_max_length, truck_max_width, truck_max_height),
+            fallback
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.write(f"**Truk {t}** muatan terpack dengan baik:")
+        fig = create_truck_figure(
+            (truck_max_length, truck_max_width, truck_max_height),
+            layout
+        )
+        st.plotly_chart(fig, use_container_width=True)
