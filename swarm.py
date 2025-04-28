@@ -7,7 +7,7 @@ import json
 import os
 import numpy as np
 import itertools
-from itertools import combinations
+from itertools import combinations, permutations
 import plotly.graph_objects as go
 from functools import lru_cache
 
@@ -16,6 +16,17 @@ np.random.seed(30)
 
 def quick_feasible(truck_dims, items):
     L, W, H = truck_dims
+
+    for it in items:
+        dims = it['dims']
+        fits_somehow = False
+        for (l, w, h) in set(permutations(dims, 3)):
+            if l <= L and w <= W and h <= H:
+                fits_somehow = True
+                break
+        if not fits_somehow:
+            return False
+
     total_vol = sum(l*w*h for l, w, h in (it['dims'] for it in items))
     if total_vol > L*W*H:
         return False
@@ -24,12 +35,12 @@ def quick_feasible(truck_dims, items):
         return False
     return True
 
-@lru_cache(maxsize=128)
+@lru_cache(maxsize=256)
 def packing_penalty_cache(truck_dims, items_tuple):
     items = [ {'id':i[0], 'name':i[1], 'dims':i[2]} for i in items_tuple ]
     packer = PackingPSO(truck_dims, items)
-    _, pen = packer.optimize(max_iters=100)
-    return pen
+    layout, pen = packer.optimize(max_iters=100)
+    return layout, pen
 
 class PackingPSO:
     def __init__(self, truck_dims, items,
@@ -247,6 +258,7 @@ truck_max_weight = 1000
 truck_max_length = 200
 truck_max_width  = 150
 truck_max_height = 150
+floor_diag = math.hypot(truck_max_length, truck_max_width)
 
 city_coords = {
     "Surabaya": (-7.2575, 112.7521), 
@@ -275,9 +287,15 @@ for item in items:
     cat, factor = get_dimension_category(l, w, h)
     item["dim_category"] = cat
     item["cat_factor"] = factor
-    item["is_oversized"] = (l > truck_max_length or 
-                        w > truck_max_width or 
-                        h > truck_max_height)
+    # can_axis_fit = any(
+    #     (dx <= truck_max_length and dy <= truck_max_weight and dz <= truck_max_height)
+    #     for dx, dy, dz in permutations((l, w, h))
+    # )
+    # can_diag_fit = any(
+    #     (max(dx, dy) <= floor_diag and dz <= truck_max_height)
+    #     for dx, dy, dz in permutations((l, w, h))
+    # )
+    # item["is_oversized"] = not (can_axis_fit or can_diag_fit)
 
 ###############################
 # Fungsi Perhitungan Jarak (Haversine)
@@ -346,6 +364,8 @@ def compute_fitness(assignment):
     }
     total_revenue = 0.0
     total_penalty = 0.0
+    layouts = {}
+    pack_penalties = {}
 
     for idx, truck in enumerate(assignment):
         if truck == 0:
@@ -355,10 +375,8 @@ def compute_fitness(assignment):
         item_vol = l * w * h
 
         if not any(
-            perm[0] <= truck_max_length and
-            perm[1] <= truck_max_width  and
-            perm[2] <= truck_max_height
-            for perm in itertools.permutations((l, w, h))
+            (dx <= truck_max_length and dy <= truck_max_width and dz <= truck_max_height)
+            for dx,dy,dz in itertools.permutations((l,w,h))
         ):
             total_penalty += OUTBOUND_PENALTY_FACTOR * item_vol
             continue
@@ -376,11 +394,13 @@ def compute_fitness(assignment):
             continue
 
         if not quick_feasible((truck_max_length, truck_max_width, truck_max_height), its):
-            total_penalty += 1000.0      
+            total_penalty += 10000000.0      
 
         tpl = tuple((it["id"], it["name"], it["dims"]) for it in its)
-        pen = packing_penalty_cache((truck_max_length, truck_max_width, truck_max_height), tpl)
+        layout, pen = packing_penalty_cache((truck_max_length, truck_max_width, truck_max_height), tpl)
         total_penalty += pen
+        layouts[t] = layout
+        pack_penalties[t] = pen
 
     FUEL_PRICE_PER_L       = 9000
     TRUCK_CONSUMPTION_KM_L = 4
@@ -392,7 +412,8 @@ def compute_fitness(assignment):
     )
 
     profit = total_revenue - total_cost
-    return profit - total_penalty
+    fitness = profit - total_penalty
+    return fitness, layouts, pack_penalties
 
 
 
@@ -400,13 +421,16 @@ def decode_position(position):
     """Konversi posisi continuous ke assignment diskrit (0-4) dengan pembulatan terdekat."""
     assignment = []
     for i, val in enumerate(position):
-        item = items[i]
-        if item["is_oversized"]:
-            assignment.append(0)
-        else:
-            clamped = max(1, min(n_trucks, val))
-            assign = int(round(clamped))
-            assignment.append(assign)
+        # item = items[i]
+        clamped = max(1, min(n_trucks, val))
+        assign = int(round(clamped))
+        assignment.append(assign)
+        # if item["is_oversized"]:
+        #     assignment.append(0)
+        # else:
+        #     clamped = max(1, min(n_trucks, val))
+        #     assign = int(round(clamped))
+        #     assignment.append(assign)
     return assignment
 
 ###############################
@@ -437,15 +461,16 @@ prev_gbest = -float('inf')
 for _ in range(num_particles):
     position = []
     for item in items:
-        if item["is_oversized"]:
-            position.append(0.0)
-        else:
-            position.append(random.uniform(1, n_trucks))
+        position.append(random.uniform(1, n_trucks))
+        # if item["is_oversized"]:
+        #     position.append(0.0)
+        # else:
+        #     position.append(random.uniform(1, n_trucks))
     velocity = [random.uniform(-n_trucks, n_trucks) for _ in range(len(items))]
     particles.append(position)
     velocities.append(velocity)
     assignment = decode_position(position)
-    fit = compute_fitness(assignment)
+    fit, _, _ = compute_fitness(assignment)
     pbest_positions.append(position[:])
     pbest_fitness.append(fit)
     if fit > gbest_fitness:
@@ -463,8 +488,12 @@ for it in range(1, max_iter+1):
                                 c1 * r1 * (pbest_positions[i][d] - particles[i][d]) +
                                 c2 * r2 * (gbest_position[d] - particles[i][d]))
             particles[i][d] += velocities[i][d]
+        # for d, item in enumerate(items):
+        #     if item["is_oversized"]:
+        #         velocities[i][d] = 0.0
+        #         particles[i][d]  = 0.0
         assignment = decode_position(particles[i])
-        fit = compute_fitness(assignment)
+        fit, _, _ = compute_fitness(assignment)
         if fit > pbest_fitness[i]:
             pbest_fitness[i] = fit
             pbest_positions[i] = particles[i][:]
@@ -485,6 +514,7 @@ for it in range(1, max_iter+1):
     prev_gbest = gbest_fitness
 
 best_assignment = decode_position(gbest_position)
+best_fitness, best_layouts, pack_penalties = compute_fitness(best_assignment)
 
 ###############################
 # Mendapatkan Info Detail per Truk
@@ -735,52 +765,43 @@ profit_df = pd.DataFrame(profit_data).set_index("Truk")
 st.subheader("Distribusi Profit per Truk")
 st.bar_chart(profit_df)
 
-final_layouts = {}
 for t in range(1, n_trucks+1):
-    items_for_truck = truck_info[t]["items"]
-    if not items_for_truck:
+    entry = best_layouts.get(t)
+    penalty = pack_penalties.get(t)
+    if entry is None:
         continue
-    best_penalty = float('inf')
-    best_layout = None
-    for seed in (42, 99, 2025):
-        np.random.seed(seed)
-        packer = PackingPSO(
-            (truck_max_length, truck_max_width, truck_max_height),
-            items_for_truck
-        )
-        layout, penalty = packer.optimize(max_iters=200)
-        if penalty < best_penalty:
-            best_penalty, best_layout = penalty, layout
-            if penalty == 0:
-                break
-    final_layouts[t] = (best_layout, best_penalty)
+
+    if (isinstance(entry, tuple)
+        and len(entry) >= 2
+        and isinstance(entry[1], (int, float))):
+        layout, pen = entry[0], entry[1]
+    else:
+        layout, pen = entry, 0.0
+
+    truck_info[t]['layout']  = entry
+    truck_info[t]['penalty'] = penalty
 
 st.subheader("Visualisasi Muatan per Truk")
-for t in range(1, n_trucks+1):
-    layout, penalty = final_layouts.get(t, (None, None))
-    if layout is None:
+for t, info in truck_info.items():
+    items   = info.get('items', [])
+    layout  = info.get('layout',  [])
+    penalty = info.get('penalty', 0.0)
+
+    if not items:
         st.write(f"Truk {t}: tidak ada muatan.")
-    elif penalty > 0:
+        continue
+
+    if penalty > 0:
         st.error(f"⚠️ Truk {t} gagal dipacking (penalty={penalty:.0f}).")
-        fallback = []
-        x_off = 0
-        for item in truck_info[t]["items"]:
-            l,w,h = item["dims"]
-            fallback.append({
-                'name': item['name'],
-                'x': x_off, 'y': 0, 'z': 0,
-                'w': l, 'd': w, 'h': h
-            })
-            x_off += l + 5
         fig = create_truck_figure(
             (truck_max_length, truck_max_width, truck_max_height),
-            fallback
+            layout
         )
-        st.plotly_chart(fig, use_container_width=True)
     else:
         st.write(f"**Truk {t}** muatan terpack dengan baik:")
         fig = create_truck_figure(
             (truck_max_length, truck_max_width, truck_max_height),
             layout
         )
-        st.plotly_chart(fig, use_container_width=True)
+
+    st.plotly_chart(fig, use_container_width=True)
