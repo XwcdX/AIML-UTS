@@ -21,30 +21,30 @@ random.seed(30)
 np.random.seed(30)
 
 # --- Constants ---
-OVERLAP_PENALTY_FACTOR = 2.0
-OUTBOUND_PENALTY_FACTOR = 2.0
+OVERLAP_PENALTY_FACTOR = 4.0 # Naikkan sedikit (dari 2.0) -> Lebih hindari overlap
+OUTBOUND_PENALTY_FACTOR = 2.0 # Tetap
 # --- PENALTI KENDALA ---
-OVERWEIGHT_CONSTANT_PENALTY = 1e9 # Penalti konstan sangat besar jika overweight (lebih besar dari profit manapun)
-OVERWEIGHT_FACTOR_PENALTY = 10000.0 # Penalti proporsional dg kuadrat kelebihan berat
-UNSUPPORTED_PENALTY_BASE = 10000.0  # Penalti dasar jika item tidak didukung
-UNSUPPORTED_PENALTY_HEIGHT_FACTOR = 200.0 # Penalti tambahan berdasarkan tinggi item
+OVERWEIGHT_CONSTANT_PENALTY = 1e9
+OVERWEIGHT_FACTOR_PENALTY = 10000.0
+UNSUPPORTED_PENALTY_BASE = 15000.0  # Naikkan sedikit (dari 10000.0) -> Lebih hindari melayang
+UNSUPPORTED_PENALTY_HEIGHT_FACTOR = 250.0 # Naikkan sedikit (dari 200.0)
 # --- Penalti Prioritas Item Besar di Bawah ---
-HEIGHT_VOLUME_PENALTY_FACTOR = 0.005 # Faktor penalti: Volume * Tinggi Posisi Z (PERLU TUNING)
+HEIGHT_VOLUME_PENALTY_FACTOR = 0.005 # Tetap dulu, bisa dicoba naik/turun nanti
 # ---------------------------------------------
 
 # --- Optimasi: Parameter untuk Packing Cepat (Estimasi Fitness di PSO Luar) ---
-PACKING_CACHE_MAX_ITERS = 25     # Iterasi packing dikurangi drastis untuk cache
-PACKING_CACHE_NUM_PARTICLES = 15 # Partikel packing dikurangi drastis untuk cache
+PACKING_CACHE_MAX_ITERS = 30     # Naikkan sedikit? (dari 25) -> optional
+PACKING_CACHE_NUM_PARTICLES = 18 # Naikkan sedikit? (dari 15) -> optional
 # --------------------------------------------------------------------
 
 # --- Parameter untuk Packing Final (Visualisasi Kualitas Tinggi) ---
-FINAL_PACKING_MAX_ITERS = 300    # Iterasi lebih banyak untuk hasil akhir
-FINAL_PACKING_NUM_PARTICLES = 50 # Partikel lebih banyak untuk hasil akhir
+FINAL_PACKING_MAX_ITERS = 600    # Tingkatkan JAUH (dari 300) -> Lebih banyak waktu cari solusi
+FINAL_PACKING_NUM_PARTICLES = 60 # Tingkatkan sedikit (dari 50) -> Lebih banyak eksplorasi
 # --------------------------------------------------------------------
 
 # --- Parameter PSO (Umum) ---
-W_MAX = 0.9  # Inertia weight max
-W_MIN = 0.4  # Inertia weight min
+W_MAX = 0.9
+W_MIN = 0.4
 # -----------------
 
 def quick_feasible(truck_dims, items):
@@ -572,13 +572,41 @@ final_truck_info, assigned_items_df = get_truck_info(best_assignment)
 
 # --- Fungsi Bantuan Rute ---
 def get_route_sequence(cities):
-    if not cities: return ["Surabaya"]; unique_cities = list(dict.fromkeys(cities))
-    if not unique_cities: return ["Surabaya"]
-    route = ["Surabaya"]; current = "Surabaya"; unvisited = unique_cities[:]
+    """Menentukan urutan kota yang dikunjungi (Nearest Neighbor dari Surabaya)."""
+    if not cities: return ["Surabaya"] # Hanya base jika tidak ada tujuan
+
+    # --- PERBAIKAN: Pastikan baris ini ada dan aktif ---
+    unique_cities = list(dict.fromkeys(cities)) # Ambil unik dari list kota tujuan
+    # --------------------------------------------------
+
+    if not unique_cities: return ["Surabaya"] # Jika setelah di-unik-kan jadi kosong
+
+    route = ["Surabaya"]
+    current = "Surabaya"
+    unvisited = unique_cities[:] # Salin list kota unik untuk dilacak
+
     while unvisited:
-        nearest = min(unvisited, key=lambda c: distance(current, c)); route.append(nearest)
-        current = nearest; unvisited.remove(nearest)
-    route.append("Surabaya"); return route
+        # Cari kota terdekat yang belum dikunjungi dari kota saat ini
+        # Handle jika distance() mengembalikan inf
+        distances_to_unvisited = {city: distance(current, city) for city in unvisited}
+        valid_distances = {city: dist for city, dist in distances_to_unvisited.items() if dist != float('inf')}
+
+        if not valid_distances:
+            # Jika semua kota tersisa tidak terjangkau (jarak inf)
+            print(f"PERINGATAN: Tidak bisa mencapai kota tersisa {unvisited} dari {current}. Mengakhiri rute.")
+            route.append("Surabaya") # Coba kembali ke Surabaya
+            return route # Kembalikan rute sejauh ini
+
+        # Cari yang terdekat dari yang valid
+        nearest = min(valid_distances, key=valid_distances.get)
+
+        route.append(nearest)
+        current = nearest
+        unvisited.remove(nearest)
+
+    # Kembali ke base setelah semua kota unik dikunjungi
+    route.append("Surabaya")
+    return route
 
 def get_segment_path(city_a, city_b):
     if city_a == city_b: return []
